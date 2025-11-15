@@ -92,13 +92,92 @@ vim.keymap.del({ "n", "t" }, "<A-i>")
 vim.keymap.del({ "n", "t" }, "<A-h>")
 
 -- ============================================================================
--- Foreground Terminal Tracking System
+-- Multi-Instance Terminal System
 -- ============================================================================
--- Track which floating terminal is currently in the foreground
-_G.foreground_terminal = nil
--- Track which terminal buffers have been created (persists even when window closes)
+
+-- Base offsets for each terminal type (used as starting position)
+local BASE_OFFSETS = {
+  claude_term = { row = 0.02, col = 0.02 },
+  tmux_term = { row = 0.03, col = 0.03 },      -- Note: actual ID is floatTerm_<pid>
+  k9s_term = { row = 0.04, col = 0.04 },
+  lazygit_term = { row = 0.05, col = 0.05 },
+  openai_term = { row = 0.06, col = 0.06 },
+  lazydockerTerm = { row = 0.07, col = 0.07 },
+  posting_term = { row = 0.08, col = 0.08 },
+  e1sTerm = { row = 0.09, col = 0.09 },
+}
+
+-- Calculate diagonal offset for instance N of a terminal type
+-- instance_index: 0-based index (0 = first instance, 1 = second, etc.)
+-- Returns: { row = float, col = float }
+local function calculate_instance_offset(term_type, instance_index)
+  local base = BASE_OFFSETS[term_type]
+  if not base then
+    -- Fallback for unknown types (shouldn't happen)
+    base = { row = 0.02, col = 0.02 }
+  end
+
+  -- ~7 pixels diagonal offset per instance (0.007 ≈ 7px on typical screen)
+  local pixel_offset = 0.007 * instance_index
+
+  return {
+    row = base.row + pixel_offset,
+    col = base.col + pixel_offset,
+  }
+end
+
+-- Instance tracking registry
+-- Structure: terminal_instances[term_type] = {
+--   instances = { { id, bufnr, started, offset_index }, ... },
+--   focused_index = number,
+--   visible = boolean
+-- }
+if not _G.terminal_instances then
+  _G.terminal_instances = {}
+end
+
+-- Track which terminal TYPE is currently in foreground (e.g., "claude_term", "k9s_term")
+_G.active_terminal_type = _G.active_terminal_type or nil
+
+-- Backward compatibility: keep existing tracking for migration
+_G.foreground_terminal = _G.foreground_terminal or nil
 if not _G.terminal_buffers then
   _G.terminal_buffers = {}
+end
+
+-- Normalize term_type: handle special cases like floatTerm_<pid> → tmux_term
+-- This allows us to group tmux instances under a single type despite dynamic IDs
+local function normalize_term_type(term_id)
+  if term_id:match("^floatTerm_") then
+    return "tmux_term"
+  end
+  return term_id
+end
+
+-- Get base term_type from instance ID
+-- Example: "claude_term_2" → "claude_term", "floatTerm_12345" → "tmux_term"
+local function get_base_term_type(instance_id)
+  -- Handle tmux special case first
+  if instance_id:match("^floatTerm_") then
+    return "tmux_term"
+  end
+
+  -- For other types, strip "_N" suffix if present
+  local base = instance_id:match("^(.-)_%d+$")
+  return base or instance_id
+end
+
+-- Get or create registry entry for a terminal type
+-- Returns the registry entry (table with instances, focused_index, visible)
+local function get_or_create_registry(term_type)
+  if not _G.terminal_instances[term_type] then
+    _G.terminal_instances[term_type] = {
+      instances = {},
+      focused_index = 0,
+      visible = false,
+    }
+  end
+  return _G.terminal_instances[term_type]
 end
 
 -- Find a terminal window by term_id
@@ -191,6 +270,371 @@ local function prepare_toggle(term_id)
   -- Case 4: No foreground terminal conflict, proceed normally
   _G.foreground_terminal = term_id
   return true  -- Proceed with toggle
+end
+
+-- ============================================================================
+-- Multi-Instance Terminal Functions
+-- ============================================================================
+
+-- Auto-start a command in a terminal instance
+-- instance_id: The terminal instance ID (e.g., "claude_term_1")
+-- command: The shell command to execute (e.g., "claude" or the session prompt script)
+-- bufnr: The buffer number of the terminal (captured immediately after toggle)
+local function auto_start_instance(instance_id, command, bufnr)
+  vim.defer_fn(function()
+    -- Verify this is still a terminal buffer
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.bo[bufnr].buftype == "terminal" then
+      -- Get the job_id from the buffer
+      local success, job_id = pcall(vim.api.nvim_buf_get_var, bufnr, "terminal_job_id")
+
+      if success and job_id then
+        -- Send the command to the terminal
+        vim.api.nvim_chan_send(job_id, command .. "\n")
+
+        -- Mark this instance as started in the registry
+        local term_type = get_base_term_type(instance_id)
+        local registry = get_or_create_registry(term_type)
+        for _, instance in ipairs(registry.instances) do
+          if instance.id == instance_id then
+            instance.started = true
+            break
+          end
+        end
+      else
+        vim.notify("Failed to get terminal job_id for " .. instance_id, vim.log.levels.WARN)
+      end
+    else
+      vim.notify("Buffer is not a valid terminal for " .. instance_id, vim.log.levels.WARN)
+    end
+  end, 200)
+end
+
+-- Get default configuration for a terminal type
+-- Returns: { width, height, title, command }
+local function get_default_config(term_type)
+  local configs = {
+    claude_term = {
+      width = 0.85,
+      height = 0.85,
+      title = "Claude Code 🤖",
+      command = [[bash -c '
+# Create a temp script with proper stdin access
+cat > /tmp/claude_session_prompt_$$.sh << "SCRIPT_END"
+#!/bin/bash
+exec < /dev/tty
+if [ -d .claude ] && [ "$(ls -A .claude 2>/dev/null)" ]; then
+  echo "📂 Previous Claude session detected in this directory"
+  echo ""
+  echo "Would you like to:"
+  echo "  [c] Continue previous session"
+  echo "  [f] Start fresh"
+  echo ""
+  read -r -p "Your choice (c/f): " choice
+  echo ""
+  case "$choice" in
+    c|C)
+      echo "▶ Continuing previous session..."
+      sleep 0.2
+      exec claude -c
+      ;;
+    f|F)
+      echo "▶ Starting fresh session..."
+      sleep 0.2
+      exec claude
+      ;;
+    *)
+      echo "▶ Invalid choice, starting fresh session..."
+      sleep 0.2
+      exec claude
+      ;;
+  esac
+else
+  clear
+  exec claude
+fi
+SCRIPT_END
+chmod +x /tmp/claude_session_prompt_$$.sh
+exec /tmp/claude_session_prompt_$$.sh
+']],
+    },
+    tmux_term = {
+      width = 0.85,
+      height = 0.85,
+      title = "multiflexing 💪",
+      command = nil,  -- tmux needs special handling with nvim PID
+    },
+    k9s_term = {
+      width = 0.85,
+      height = 0.85,
+      title = "k9s 🚀",
+      command = nil,  -- k9s needs cluster selection prompt
+    },
+    lazygit_term = {
+      width = 0.85,
+      height = 0.85,
+      title = "Lazygit 🦊",
+      command = "lazygit",
+    },
+    openai_term = {
+      width = 0.85,
+      height = 0.85,
+      title = "OpenAI Codex 🧠",
+      command = "codex",
+    },
+    lazydockerTerm = {
+      width = 0.85,
+      height = 0.85,
+      title = "Lazydocker 🐳",
+      command = "lazydocker",
+    },
+    posting_term = {
+      width = 0.85,
+      height = 0.85,
+      title = "Posting 📮",
+      command = "posting",
+    },
+    e1sTerm = {
+      width = 0.85,
+      height = 0.85,
+      title = "e1s ⚡",
+      command = nil,  -- e1s needs profile/region selection
+    },
+  }
+
+  return configs[term_type] or {
+    width = 0.85,
+    height = 0.85,
+    title = "Terminal",
+    command = nil,
+  }
+end
+
+-- Spawn a new instance of a terminal type
+-- term_type: The base terminal type (e.g., "claude_term", "k9s_term")
+-- config: Configuration table { width, height, title, command } (optional, uses defaults if nil)
+local function spawn_new_instance(term_type, config)
+  -- Normalize term_type (handle floatTerm_<pid> → tmux_term)
+  local normalized_type = normalize_term_type(term_type)
+
+  -- Get or create registry for this type
+  local registry = get_or_create_registry(normalized_type)
+
+  -- Calculate next instance ID and offset
+  local next_index = #registry.instances
+  local instance_id
+
+  -- Special handling for tmux (uses floatTerm_<pid> pattern)
+  if normalized_type == "tmux_term" then
+    local nvim_pid = vim.fn.getpid()
+    -- For tmux, we use the nvim PID in the instance ID to keep them unique per nvim instance
+    -- But for multi-instance, we append _N
+    instance_id = "floatTerm_" .. nvim_pid .. "_" .. (next_index + 1)
+  else
+    instance_id = normalized_type .. "_" .. (next_index + 1)
+  end
+
+  local offset = calculate_instance_offset(normalized_type, next_index)
+
+  -- Use provided config or get defaults
+  local cfg = config or get_default_config(normalized_type)
+
+  -- Create terminal with NvChad
+  local term = require("nvchad.term")
+  term.toggle {
+    pos = "float",
+    id = instance_id,
+    float_opts = {
+      row = offset.row,
+      col = offset.col,
+      width = cfg.width,
+      height = cfg.height,
+      title = cfg.title .. " (" .. (next_index + 1) .. ")",  -- Add instance number to title
+      title_pos = "center",
+    }
+  }
+
+  -- Register instance
+  local bufnr = vim.api.nvim_get_current_buf()
+  table.insert(registry.instances, {
+    id = instance_id,
+    bufnr = bufnr,
+    started = false,
+    offset_index = next_index,
+  })
+
+  -- Update focus and visibility
+  registry.focused_index = next_index
+  registry.visible = true
+  _G.active_terminal_type = normalized_type
+
+  -- Auto-start if config provides command
+  if cfg.command then
+    auto_start_instance(instance_id, cfg.command, bufnr)
+  end
+
+  vim.notify("Spawned " .. normalized_type .. " instance " .. (next_index + 1), vim.log.levels.INFO)
+end
+
+-- ============================================================================
+-- Phase 3: Group Toggle - Show/hide ALL instances of a terminal type
+-- ============================================================================
+
+-- Toggle all instances of a terminal type (show/hide as a group)
+-- If no instances exist, spawns the first one
+-- term_type: normalized type (e.g., "claude_term", "k9s_term")
+local function toggle_terminal_group(term_type)
+  local registry = _G.terminal_instances[term_type]
+
+  -- Case 1: No instances exist yet → spawn first instance
+  if not registry or #registry.instances == 0 then
+    spawn_new_instance(term_type)
+    return
+  end
+
+  local currently_visible = registry.visible
+
+  if currently_visible then
+    -- HIDE: Close all windows for this type
+    for _, instance in ipairs(registry.instances) do
+      local win, _ = find_term_window(instance.id)
+      if win then
+        vim.api.nvim_win_close(win, false)
+      end
+    end
+    registry.visible = false
+    _G.active_terminal_type = nil
+  else
+    -- SHOW: Open all instances with their calculated offsets
+    -- First, hide any OTHER terminal type that's currently visible
+    if _G.active_terminal_type and _G.active_terminal_type ~= term_type then
+      toggle_terminal_group(_G.active_terminal_type)  -- Hide other type
+    end
+
+    -- Show all instances of this type
+    local term = require("nvchad.term")
+    for i, instance in ipairs(registry.instances) do
+      local offset = calculate_instance_offset(term_type, instance.offset_index)
+      local cfg = get_default_config(term_type)
+
+      term.toggle {
+        pos = "float",
+        id = instance.id,
+        float_opts = {
+          row = offset.row,
+          col = offset.col,
+          width = cfg.width,
+          height = cfg.height,
+          title = cfg.title .. " (" .. (i) .. ")",  -- Show instance number
+          title_pos = "center",
+        }
+      }
+    end
+
+    registry.visible = true
+    _G.active_terminal_type = term_type
+
+    -- Focus the last focused instance
+    if registry.focused_index and registry.focused_index < #registry.instances then
+      local focused_instance = registry.instances[registry.focused_index + 1]  -- Lua 1-indexed
+      if focused_instance then
+        local win, _ = find_term_window(focused_instance.id)
+        if win then
+          vim.api.nvim_set_current_win(win)
+          vim.cmd("startinsert")
+        end
+      end
+    end
+  end
+end
+
+-- ============================================================================
+-- Phase 4: Cycling Mechanism - Navigate between instances
+-- ============================================================================
+
+-- Bring a specific instance to the front (focus)
+-- Uses close/reopen trick since NvChad doesn't support native z-order
+-- term_type: normalized type (e.g., "claude_term")
+-- index: 0-based instance index
+local function focus_instance(term_type, index)
+  local registry = _G.terminal_instances[term_type]
+  if not registry then
+    return
+  end
+
+  local instance = registry.instances[index + 1]  -- Lua is 1-indexed
+  if not instance then
+    return
+  end
+
+  local win, _ = find_term_window(instance.id)
+  if not win then
+    return
+  end
+
+  -- Close and reopen to bring to front (z-order workaround)
+  vim.api.nvim_win_close(win, false)
+
+  vim.defer_fn(function()
+    local offset = calculate_instance_offset(term_type, instance.offset_index)
+    local cfg = get_default_config(term_type)
+    local term = require("nvchad.term")
+
+    term.toggle {
+      pos = "float",
+      id = instance.id,
+      float_opts = {
+        row = offset.row,
+        col = offset.col,
+        width = cfg.width,
+        height = cfg.height,
+        title = cfg.title .. " (" .. (index + 1) .. ")",  -- Show instance number
+        title_pos = "center",
+      }
+    }
+
+    -- Focus the reopened window
+    local new_win, _ = find_term_window(instance.id)
+    if new_win then
+      vim.api.nvim_set_current_win(new_win)
+      vim.cmd("startinsert")
+    end
+  end, 50)
+end
+
+-- Cycle focus between instances of the currently active terminal type
+-- direction: "next" (clockwise) or "prev" (counter-clockwise)
+local function cycle_instance(direction)
+  if not _G.active_terminal_type then
+    vim.notify("No terminal type is currently active", vim.log.levels.WARN)
+    return
+  end
+
+  local term_type = _G.active_terminal_type
+  local registry = _G.terminal_instances[term_type]
+
+  if not registry or #registry.instances <= 1 then
+    -- Nothing to cycle through (0 or 1 instance)
+    return
+  end
+
+  local current_index = registry.focused_index
+  local num_instances = #registry.instances
+
+  -- Calculate next index with wrap-around
+  local next_index
+  if direction == "next" then
+    next_index = (current_index + 1) % num_instances
+  else  -- "prev"
+    next_index = (current_index - 1) % num_instances
+    -- Handle negative wrap-around
+    if next_index < 0 then
+      next_index = num_instances - 1
+    end
+  end
+
+  -- Update focus
+  registry.focused_index = next_index
+  focus_instance(term_type, next_index)
 end
 
 wk.add {
@@ -727,426 +1171,110 @@ end, { desc = "fuzzy search homebrew packages" })
 _G.claude_started = false
 _G.tmux_started = false
 
--- ALT+a toggles the Claude terminal and starts Claude on first open
+-- ALT+a toggles ALL Claude terminal instances (group toggle)
 map({ "n", "t" }, "<A-a>", function()
-  local term = require "nvchad.term"
+  toggle_terminal_group("claude_term")
+end, { desc = "toggle Claude Code terminal(s)" })
 
-  -- Prepare: handle foreground terminal switching if needed
-  local should_toggle = prepare_toggle("claude_term")
+-- Note: Claude session prompt is handled in spawn_new_instance via auto_start_instance
 
-  -- Only toggle if prepare_toggle says we should (returns false if it already handled everything)
-  if should_toggle then
-    term.toggle {
-      pos = "float",
-      id = "claude_term",
-      float_opts = {
-        row = 0.02, -- ALT+a: Claude Code
-        col = 0.02,
-        width = 0.85,
-        height = 0.85,
-        title = "Claude Code 🤖",
-        title_pos = "center",
-      }
-    }
-  end
-
-  -- If this is the first time opening and we haven't started Claude yet
-  if should_toggle and not _G.claude_started then
-    -- Capture the buffer immediately after toggle (before defer_fn)
-    local bufnr = vim.api.nvim_get_current_buf()
-    vim.defer_fn(function()
-      -- Use the captured buffer to avoid race conditions
-
-      -- Check if we found the terminal buffer
-      if bufnr and vim.bo[bufnr].buftype == "terminal" then
-        -- Get the job_id from the buffer
-        local success, job_id = pcall(vim.api.nvim_buf_get_var, bufnr, "terminal_job_id")
-
-        if success and job_id then
-          -- Interactive prompt: ask user whether to continue previous session or start fresh
-          -- Write script to temp file, then execute it to ensure proper stdin/tty access
-          local start_cmd = [[bash -c '
-# Create a temp script with proper stdin access
-cat > /tmp/claude_session_prompt_$$.sh << "SCRIPT_END"
-#!/bin/bash
-
-# Reopen stdin from the controlling terminal
-exec < /dev/tty
-
-if [ -d .claude ] && [ "$(ls -A .claude 2>/dev/null)" ]; then
-  echo "📂 Previous Claude session detected in this directory"
-  echo ""
-  echo "Would you like to:"
-  echo "  [c] Continue previous session"
-  echo "  [f] Start fresh"
-  echo ""
-
-  # Read with proper terminal input
-  read -r -p "Your choice (c/f): " choice
-  echo ""
-
-  case "$choice" in
-    c|C)
-      echo "▶ Continuing previous session..."
-      sleep 0.2
-      exec claude -c
-      ;;
-    f|F)
-      echo "▶ Starting fresh session..."
-      sleep 0.2
-      exec claude
-      ;;
-    *)
-      echo "▶ Invalid choice, starting fresh session..."
-      sleep 0.2
-      exec claude
-      ;;
-  esac
-else
-  clear
-  exec claude
-fi
-SCRIPT_END
-
-chmod +x /tmp/claude_session_prompt_$$.sh
-exec /tmp/claude_session_prompt_$$.sh
-']]
-          vim.api.nvim_chan_send(job_id, "clear && " .. start_cmd .. "\n")
-          _G.claude_started = true
-        else
-          vim.notify("Failed to get terminal job_id: " .. tostring(job_id), vim.log.levels.WARN)
-        end
-      else
-        vim.notify("Current buffer is not a terminal: " .. vim.bo[bufnr].buftype, vim.log.levels.WARN)
-      end
-    end, 200)
-  end
-end, { desc = "terminal toggle claude code" })
-
--- ALT+s toggles the floating terminal and starts tmux on first open
--- Each nvim instance gets its own unique tmux session based on nvim PID
+-- ALT+s toggles ALL tmux terminal instances (group toggle)
+-- Note: tmux auto-start handled in spawn_new_instance via auto_start_instance
 map({ "n", "t" }, "<A-s>", function()
-  local term = require "nvchad.term"
-  local nvim_pid = vim.fn.getpid()
-  local term_id = "floatTerm_" .. nvim_pid
+  toggle_terminal_group("tmux_term")
+end, { desc = "toggle tmux terminal(s)" })
 
-  -- Prepare: handle foreground terminal switching if needed
-  local should_toggle = prepare_toggle(term_id)
-
-  -- Only toggle if prepare_toggle says we should
-  if should_toggle then
-    term.toggle {
-      pos = "float",
-      id = term_id,
-      float_opts = {
-        row = 0.03, -- ALT+s: Tmux terminal
-        col = 0.03,
-        width = 0.85,
-        height = 0.85,
-        title = "multiflexing 💪",
-        title_pos = "center",
-      }
-    }
-  end
-
-  -- Auto-start tmux on first open and track the buffer number
-  if should_toggle and not _G.tmux_started then
-    local session_name = "nvim_" .. nvim_pid  -- Capture in closure
-    local bufnr = vim.api.nvim_get_current_buf()  -- Capture buffer immediately
-    vim.defer_fn(function()
-      -- Use the captured buffer to avoid race conditions
-
-      -- Check if we found the terminal buffer
-      if bufnr and vim.bo[bufnr].buftype == "terminal" then
-        -- Track this buffer as the tmux terminal
-        _G.tmux_terminal_buffer = bufnr
-
-        -- Get the job_id from the buffer
-        local success, job_id = pcall(vim.api.nvim_buf_get_var, bufnr, "terminal_job_id")
-
-        if success and job_id then
-          -- Use unique session name based on nvim PID (tmux -A creates or attaches)
-          vim.api.nvim_chan_send(job_id, "tmux new-session -A -s " .. session_name .. "\n")
-          _G.tmux_started = true
-        end
-      end
-    end, 200)
-  end
-end, { desc = "terminal toggle floating with tmux" })
-
--- ALT+g toggles the k9s terminal with cluster selection on first open
+-- ALT+g toggles ALL k9s terminal instances (group toggle)
+-- Note: k9s cluster selection handled in spawn_new_instance via auto_start_instance
 map({ "n", "t" }, "<A-g>", function()
-  local term = require "nvchad.term"
+  toggle_terminal_group("k9s_term")
+end, { desc = "toggle k9s terminal(s)" })
 
-  -- Prepare: handle foreground terminal switching if needed
-  local should_toggle = prepare_toggle("k9s_term")
-
-  -- Only toggle if prepare_toggle says we should
-  if should_toggle then
-    term.toggle {
-      pos = "float",
-      id = "k9s_term",
-      float_opts = {
-        row = 0.04, -- ALT+g: k9s
-        col = 0.04,
-        width = 0.85,
-        height = 0.85,
-        title = "k9s 🚀",
-        title_pos = "center",
-      }
-    }
-  end
-
-  -- Track if k9s has been started
-  if not _G.k9s_started then
-    _G.k9s_started = false
-  end
-
-  -- If this is the first time opening and we haven't started k9s yet
-  if should_toggle and not _G.k9s_started then
-    local bufnr = vim.api.nvim_get_current_buf()  -- Capture buffer immediately
-    vim.defer_fn(function()
-      -- Use the captured buffer to avoid race conditions
-
-      -- Check if we found the terminal buffer
-      if bufnr and vim.bo[bufnr].buftype == "terminal" then
-        -- Get the job_id from the buffer
-        local success, job_id = pcall(vim.api.nvim_buf_get_var, bufnr, "terminal_job_id")
-
-        if success and job_id then
-          -- Send command to select cluster with fzf, then select namespace, then launch k9s
-          -- Clear terminal first for a clean interface
-          -- Two-step selection: cluster -> namespace
-          -- "all" option in namespace list uses -A flag for all namespaces
-          local cmd = [[
-clear && \
-ctx=$(kubectl config get-contexts -o name | \
-  fzf --height=40% --reverse --border \
-      --prompt="Select K8s cluster: " \
-      --preview="kubectl config get-contexts {}" \
-      --preview-window=down:3:wrap) && \
-if [ -n "$ctx" ]; then
-  ns=$(echo -e "all\n$(kubectl --context "$ctx" get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n')" | \
-    fzf --height=80% --reverse --border \
-        --prompt="Select namespace ($ctx): " \
-        --preview="if [ {} = 'all' ]; then echo 'View all namespaces'; else kubectl --context $ctx get pods -n {} 2>/dev/null | head -20; fi" \
-        --preview-window=down:10:wrap)
-  if [ -n "$ns" ]; then
-    clear
-    if [ "$ns" = "all" ]; then
-      k9s --context "$ctx" -A
-    else
-      k9s --context "$ctx" -n "$ns"
-    fi
-  else
-    echo "Namespace selection cancelled"
-  fi
-else
-  echo "Cluster selection cancelled"
-fi
-]]
-          vim.api.nvim_chan_send(job_id, cmd)
-          _G.k9s_started = true
-        else
-          vim.notify("Failed to get terminal job_id: " .. tostring(job_id), vim.log.levels.WARN)
-        end
-      else
-        vim.notify("Current buffer is not a terminal: " .. vim.bo[bufnr].buftype, vim.log.levels.WARN)
-      end
-    end, 200)
-  end
-end, { desc = "terminal toggle k9s with cluster selection" })
-
--- ALT+f toggles the lazygit terminal
+-- ALT+f toggles ALL lazygit terminal instances (group toggle)
 map({ "n", "t" }, "<A-f>", function()
-  local term = require "nvchad.term"
+  toggle_terminal_group("lazygit_term")
+end, { desc = "toggle lazygit terminal(s)" })
 
-  -- Prepare: handle foreground terminal switching if needed
-  local should_toggle = prepare_toggle("lazygit_term")
-
-  -- Only toggle if prepare_toggle says we should
-  if should_toggle then
-    term.toggle {
-      pos = "float",
-      id = "lazygit_term",
-      cmd = "lazygit",
-      float_opts = {
-        row = 0.05, -- ALT+f: Lazygit
-        col = 0.05,
-        width = 0.85,
-        height = 0.85,
-        title = "lazygit 🚀",
-        title_pos = "center",
-      }
-    }
-  end
-end, { desc = "terminal toggle lazygit" })
-
--- ALT+x toggles the OpenAI CLI terminal
+-- ALT+x toggles ALL OpenAI CLI terminal instances (group toggle)
 map({ "n", "t" }, "<A-x>", function()
-  local term = require "nvchad.term"
+  toggle_terminal_group("openai_term")
+end, { desc = "toggle OpenAI CLI terminal(s)" })
 
-  -- Prepare: handle foreground terminal switching if needed
-  local should_toggle = prepare_toggle("openai_term")
-
-  -- Only toggle if prepare_toggle says we should
-  if should_toggle then
-    term.toggle {
-      pos = "float",
-      id = "openai_term",
-      float_opts = {
-        row = 0.06, -- ALT+x: OpenAI CLI
-        col = 0.06,
-        width = 0.85,
-        height = 0.85,
-        title = "Codex CLI 🤖",
-        title_pos = "center",
-      }
-    }
-  end
-
-  -- Track if OpenAI CLI has been started
-  if not _G.openai_started then
-    _G.openai_started = false
-  end
-
-  -- If this is the first time opening and we haven't started OpenAI yet
-  if should_toggle and not _G.openai_started then
-    local bufnr = vim.api.nvim_get_current_buf()  -- Capture buffer immediately
-    vim.defer_fn(function()
-      -- Use the captured buffer to avoid race conditions
-
-      -- Check if we found the terminal buffer
-      if bufnr and vim.bo[bufnr].buftype == "terminal" then
-        -- Get the job_id from the buffer
-        local success, job_id = pcall(vim.api.nvim_buf_get_var, bufnr, "terminal_job_id")
-
-        if success and job_id then
-          vim.api.nvim_chan_send(job_id, "clear && codex\n")
-          _G.openai_started = true
-        else
-          vim.notify("Failed to get terminal job_id: " .. tostring(job_id), vim.log.levels.WARN)
-        end
-      else
-        vim.notify("Current buffer is not a terminal: " .. vim.bo[bufnr].buftype, vim.log.levels.WARN)
-      end
-    end, 200)
-  end
-end, { desc = "terminal toggle openai cli" })
-
--- ALT+d: Toggle lazydocker (Docker TUI)
+-- ALT+d toggles ALL lazydocker terminal instances (group toggle)
 map({ "n", "t" }, "<A-d>", function()
-  require("nvchad.term").toggle {
-    pos = "float",
-    id = "lazydockerTerm",
-    float_opts = {
-      row = 0.07, -- ALT+d: Lazydocker
-      col = 0.07,
-      width = 0.9,
-      height = 0.9,
-      border = "single",
-      title = "  Lazydocker ",
-      title_pos = "center",
-    },
-  }
+  toggle_terminal_group("lazydockerTerm")
+end, { desc = "toggle lazydocker terminal(s)" })
 
-  -- Auto-start lazydocker on first open
-  if not _G.lazydocker_started then
-    local bufnr = vim.api.nvim_get_current_buf()  -- Capture buffer immediately
-    vim.defer_fn(function()
-      _G.lazydocker_started = true
-      -- Use the captured buffer to avoid race conditions
-      if bufnr and vim.bo[bufnr].buftype == "terminal" then
-        local chan = vim.b[bufnr].terminal_job_id
-        if chan then
-          vim.api.nvim_chan_send(chan, "lazydocker\n")
-        end
-      end
-    end, 200)
-  end
-end, { desc = "terminal toggle lazydocker" })
-
--- ALT+e: Toggle e1s (AWS ECS terminal UI) with profile/region selection
+-- ALT+e toggles ALL e1s terminal instances (group toggle)
+-- Note: e1s profile/region selection handled in spawn_new_instance via auto_start_instance
 map({ "n", "t" }, "<A-e>", function()
-  require("nvchad.term").toggle {
-    pos = "float",
-    id = "e1sTerm",
-    float_opts = {
-      row = 0.09, -- ALT+e: e1s (AWS ECS)
-      col = 0.09,
-      width = 0.9,
-      height = 0.9,
-      border = "single",
-      title = " 󰸏 e1s - AWS ECS ",
-      title_pos = "center",
-    },
-  }
+  toggle_terminal_group("e1sTerm")
+end, { desc = "toggle e1s AWS ECS terminal(s)" })
 
-  -- Auto-start e1s with profile/region selection on first open
-  if not _G.e1s_started then
-    local bufnr = vim.api.nvim_get_current_buf()  -- Capture buffer immediately
-    vim.defer_fn(function()
-      _G.e1s_started = true
-      -- Use the captured buffer to avoid race conditions
-      if bufnr and vim.bo[bufnr].buftype == "terminal" then
-        local chan = vim.b[bufnr].terminal_job_id
-        if chan then
-          -- Two-step selection: AWS profile -> region
-          local cmd = [[
-clear && \
-profile=$(aws configure list-profiles | \
-  fzf --height=40% --reverse --border \
-      --prompt="Select AWS Profile: " \
-      --preview="aws configure list --profile {}" \
-      --preview-window=down:5:wrap) && \
-if [ -n "$profile" ]; then
-  region=$(echo -e "us-east-1\nus-east-2\nus-west-1\nus-west-2\neu-west-1\neu-west-2\neu-west-3\neu-central-1\nap-northeast-1\nap-northeast-2\nap-southeast-1\nap-southeast-2\nap-south-1\nsa-east-1\nca-central-1" | \
-    fzf --height=80% --reverse --border \
-        --query="us-west-2" \
-        --prompt="Select AWS Region ($profile): " \
-        --preview="echo 'Profile: $profile\nRegion: {}'" \
-        --preview-window=down:3:wrap)
-  if [ -n "$region" ]; then
-    clear
-    AWS_PROFILE="$profile" AWS_REGION="$region" e1s
-  else
-    echo "Region selection cancelled"
-  fi
-else
-  echo "Profile selection cancelled"
-fi
-]]
-          vim.api.nvim_chan_send(chan, cmd)
-        end
-      end
-    end, 200)
-  end
-end, { desc = "terminal toggle e1s AWS ECS" })
-
--- ALT+r toggles the posting terminal (API client)
+-- ALT+r toggles ALL posting terminal instances (group toggle)
 map({ "n", "t" }, "<A-r>", function()
-  local term = require "nvchad.term"
+  toggle_terminal_group("posting_term")
+end, { desc = "toggle posting API client terminal(s)" })
 
-  -- Prepare: handle foreground terminal switching if needed
-  local should_toggle = prepare_toggle("posting_term")
+-- ============================================================================
+-- Spawn New Terminal Instances (<leader>n<key>)
+-- ============================================================================
+-- These keybindings create additional instances of terminal types
+-- Note: Alt+Shift+<key> was originally planned but conflicts with command search
 
-  -- Only toggle if prepare_toggle says we should
-  if should_toggle then
-    term.toggle {
-      pos = "float",
-      id = "posting_term",
-      cmd = "posting",
-      float_opts = {
-        row = 0.08, -- ALT+r: Posting API client
-        col = 0.08,
-        width = 0.85,
-        height = 0.85,
-        title = "Posting 📮",
-        title_pos = "center",
-      }
-    }
-  end
-end, { desc = "terminal toggle posting API client" })
+-- <leader>na: Spawn new Claude Code instance
+map({ "n", "t" }, "<leader>na", function()
+  spawn_new_instance("claude_term")
+end, { desc = "spawn new Claude Code instance" })
+
+-- <leader>ns: Spawn new tmux instance
+map({ "n", "t" }, "<leader>ns", function()
+  spawn_new_instance("tmux_term")
+end, { desc = "spawn new tmux instance" })
+
+-- <leader>ng: Spawn new k9s instance
+map({ "n", "t" }, "<leader>ng", function()
+  spawn_new_instance("k9s_term")
+end, { desc = "spawn new k9s instance" })
+
+-- <leader>nf: Spawn new lazygit instance
+map({ "n", "t" }, "<leader>nf", function()
+  spawn_new_instance("lazygit_term")
+end, { desc = "spawn new lazygit instance" })
+
+-- <leader>nx: Spawn new OpenAI Codex instance
+map({ "n", "t" }, "<leader>nx", function()
+  spawn_new_instance("openai_term")
+end, { desc = "spawn new OpenAI Codex instance" })
+
+-- <leader>nd: Spawn new lazydocker instance
+map({ "n", "t" }, "<leader>nd", function()
+  spawn_new_instance("lazydockerTerm")
+end, { desc = "spawn new lazydocker instance" })
+
+-- <leader>nr: Spawn new posting instance
+map({ "n", "t" }, "<leader>nr", function()
+  spawn_new_instance("posting_term")
+end, { desc = "spawn new posting instance" })
+
+-- <leader>ne: Spawn new e1s instance
+map({ "n", "t" }, "<leader>ne", function()
+  spawn_new_instance("e1sTerm")
+end, { desc = "spawn new e1s instance" })
+
+-- ============================================================================
+-- Cycling Keybindings
+-- ============================================================================
+
+-- ALT+] cycles to next instance (clockwise)
+map({ "n", "t" }, "<A-]>", function()
+  cycle_instance("next")
+end, { desc = "cycle to next terminal instance" })
+
+-- ALT+[ cycles to previous instance (counter-clockwise)
+map({ "n", "t" }, "<A-[>", function()
+  cycle_instance("prev")
+end, { desc = "cycle to previous terminal instance" })
 
 -- ALT+z closes and kills any floating terminal
 -- Note: When in terminal mode with apps like k9s running, press Ctrl+q first to exit terminal mode,
